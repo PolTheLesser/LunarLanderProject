@@ -1,5 +1,100 @@
 import gymnasium as gym
 import numpy as np
+
+class AccelPenaltyWrapper(gym.RewardWrapper):
+    def __init__(self, env, max_acc=5.0, penalty_weight=1.0, kill_on_violation=False, dt=1.0):
+        super().__init__(env)
+        self.max_acc = max_acc
+        self.penalty_weight = penalty_weight
+        self.kill_on_violation = kill_on_violation
+        self.dt = dt
+
+        self.prev_vx = None
+        self.prev_vy = None
+
+        # optional: Info im observation_space unverändert lassen
+        self.reward_range = (-np.inf, np.inf)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # Geschwindigkeiten aus Observation holen
+        vx = obs[2]
+        vy = obs[3]
+        self.prev_vx = vx
+        self.prev_vy = vy
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        vx = obs[2]
+        vy = obs[3]
+
+        # diskrete Beschleunigung
+        ax = (vx - self.prev_vx) / self.dt
+        ay = (vy - self.prev_vy) / self.dt
+        a = np.sqrt(ax**2 + ay**2)
+
+        # für nächsten Schritt merken
+        self.prev_vx = vx
+        self.prev_vy = vy
+
+        # Penalty/Abbruch
+        if a > self.max_acc:
+            # negative Belohnung proportional zur Überschreitung
+            penalty = self.penalty_weight * (a - self.max_acc)
+            reward -= penalty
+
+            # optional: Episode beenden, Astronaut „stirbt“
+            if self.kill_on_violation:
+                terminated = True
+                info["accel_violation"] = True
+
+        # Beschleunigung im info mitgeben
+        info["accel"] = a
+        info["accel_vec"] = (ax, ay)
+
+        return obs, reward, terminated, truncated, info
+
+
+
+
+class TouchdownVelocityWrapper(gym.RewardWrapper):
+    def __init__(self, env, max_touchdown_speed=1.0, kill_on_violation=False, penalty=-100.0):
+        super().__init__(env)
+        self.max_touchdown_speed = max_touchdown_speed
+        self.kill_on_violation = kill_on_violation
+        self.penalty = penalty
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        vx = obs[2]
+        vy = obs[3]
+        speed = np.sqrt(vx**2 + vy**2)
+
+        leg1 = obs[6] > 0.5
+        leg2 = obs[7] > 0.5
+        touchdown = leg1 or leg2
+
+        if touchdown and not info.get("touchdown_checked", False):
+            # Erstes Mal Bodenkontakt in dieser Episode
+            info["touchdown_checked"] = True
+            info["touchdown_speed"] = speed
+
+            if speed > self.max_touchdown_speed:
+                # zu schnell aufgesetzt
+                reward += self.penalty   # z.B. -100 dazu
+                info["touchdown_too_fast"] = True
+                if self.kill_on_violation:
+                    terminated = True
+
+        return obs, reward, terminated, truncated, info
+
+
+
+import gymnasium as gym
+import numpy as np
 from dataclasses import dataclass
 
 # =============================
@@ -34,10 +129,18 @@ def create_env(render_mode=None):
         ENV_ID,
         render_mode=render_mode,
         continuous=False,
-        gravity=-10.0,
-        enable_wind=False,
+        gravity=-3.8,
+        enable_wind=True,
         wind_power=15.0,
         turbulence_power=1.5,
+    )
+    # Astronauten-Schutz einbauen
+    env = AccelPenaltyWrapper(
+        env,
+        max_acc=1.0,  # tuning-Parameter
+        penalty_weight=1.0,  # tuning-Parameter
+        kill_on_violation=True,
+        dt=1/50.0  # time interval (1 frame)
     )
     return env
 
@@ -205,7 +308,12 @@ def main():
         done = terminated or truncated
         steps += 1
 
+        # hier: Beschleunigung in der Konsole zeigen
+        if "accel" in info:
+            print(f"Step {steps:4d} | a = {info['accel']:.3f}  ax, ay = {info['accel_vec']}")
+
     print(f"Episode reward of best individual: {total_r:.2f}")
+    input("Press Enter to close the window...")
     env.close()
 
 
