@@ -201,10 +201,10 @@ def policy_act(theta: np.ndarray, obs: np.ndarray, temp=1.0, deterministic=False
     if deterministic:  # NEW: argmax for demos
         return np.argmax(logits)
     else:  # softmax for training
+        logits = np.clip(logits, -10*temp, 10*temp)  # Scale with temp
         exp_logits = np.exp(logits / temp)
         probs = exp_logits / np.sum(exp_logits)
         return np.random.choice(4, p=probs)
-
 
 # =============================
 # GA operators
@@ -386,7 +386,7 @@ def main():
 
 
 if __name__ == "__main__":
-    mode = "play"
+    mode = "train"
     if mode == "train":
         mp.set_start_method('spawn', force=True)  # Essential for Gym + multiprocessing
         main()
