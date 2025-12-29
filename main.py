@@ -1,9 +1,8 @@
-import gymnasium as gym
-import numpy as np
 import multiprocessing as mp
-from functools import partial
-import warnings
 import os
+import warnings
+
+import gymnasium as gym
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
@@ -387,7 +386,7 @@ def main():
 
 
 if __name__ == "__main__":
-    mode = "train"
+    mode = "play"
     if mode == "train":
         mp.set_start_method('spawn', force=True)  # Essential for Gym + multiprocessing
         main()
