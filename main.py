@@ -1,5 +1,12 @@
 import gymnasium as gym
 import numpy as np
+import multiprocessing as mp
+from functools import partial
+import warnings
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
+
 
 class AccelPenaltyWrapper(gym.RewardWrapper):
     def __init__(self, env, max_acc=5.0, penalty_weight=1.0, kill_on_violation=False, dt=1.0):
@@ -130,7 +137,7 @@ def create_env(render_mode=None):
         render_mode=render_mode,
         continuous=False,
         gravity=-3.8,
-        enable_wind=True,
+        enable_wind=False,
         wind_power=15.0,
         turbulence_power=1.5,
     )
@@ -139,7 +146,7 @@ def create_env(render_mode=None):
         env,
         max_acc=1.0,  # tuning-Parameter
         penalty_weight=1.0,  # tuning-Parameter
-        kill_on_violation=True,
+        kill_on_violation=False,
         dt=1/50.0  # time interval (1 frame)
     )
     return env
@@ -171,14 +178,21 @@ def unpack_weights(theta: np.ndarray):
     return w1, b1, w2, b2
 
 
-def policy_act(theta: np.ndarray, obs: np.ndarray) -> int:
-    """Forward pass through MLP and pick argmax action."""
+def policy_act(theta: np.ndarray, obs: np.ndarray, temp=1.0) -> int:  # added temp
     w1, b1, w2, b2 = unpack_weights(theta)
     x = obs.astype(np.float32)
-    h = np.tanh(x @ w1 + b1)
+
+    # CHANGE 1: ReLU instead of tanh
+    h = np.maximum(0, x @ w1 + b1)  # ReLU: max(0, value)
+
     logits = h @ w2 + b2
-    action = int(np.argmax(logits))
-    return action
+
+    # CHANGE 2: Softmax instead of argmax for exploration
+    exp_logits = np.exp(logits / temp)  # temperature controls randomness
+    probs = exp_logits / np.sum(exp_logits)
+    action = np.random.choice(4, p=probs)  # pick randomly weighted by probs
+
+    return int(action)
 
 
 # =============================
@@ -194,7 +208,7 @@ def init_population():
     return pop
 
 
-def evaluate_individual(individual: Individual, env: gym.Env) -> float:
+def evaluate_individual(individual: Individual, env):  # ADDED THIS
     rewards = []
     for _ in range(EPISODES_PER_INDIVIDUAL):
         obs, info = env.reset()
@@ -208,15 +222,30 @@ def evaluate_individual(individual: Individual, env: gym.Env) -> float:
             done = terminated or truncated
             steps += 1
         rewards.append(total_r)
-    individual.fitness = float(np.mean(rewards))
-    return individual.fitness
+    return float(np.mean(rewards))
+
+
+
+def worker_evaluate(args):
+    ind_idx, individual, env_id = args
+    env = create_env(render_mode=None)
+    fitness = evaluate_individual(individual, env)  # Your single-threaded version
+    env.close()
+    return ind_idx, fitness  # ONLY 2 VALUES
 
 
 def evaluate_population(population):
-    env = create_env(render_mode=None)
-    for ind in population:
-        evaluate_individual(ind, env)
-    env.close()
+    n_cores = min(mp.cpu_count(), POP_SIZE)
+    print(f"Evaluating {len(population)} individuals on {n_cores} cores...")
+
+    args_list = [(i, ind, ENV_ID) for i, ind in enumerate(population)]
+
+    with mp.Pool(processes=n_cores) as pool:
+        results = pool.map(worker_evaluate, args_list)
+
+    results.sort(key=lambda x: x[0])
+    for i, (ind_idx, fitness) in enumerate(results):  # FIXED: 2 values only
+        population[i].fitness = fitness
 
 
 def select_elites(population):
@@ -318,4 +347,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)  # Essential for Gym + multiprocessing
     main()
