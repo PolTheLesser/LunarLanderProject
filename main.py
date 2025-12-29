@@ -12,10 +12,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 class LegContactBonus(gym.RewardWrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        leg1, leg2 = obs[6], obs[7]
-        if leg1 > 0.5 and leg2 > 0.5:  # Both legs down
-            reward += 2.0  # Small bonus for stable hover
+        leg1, leg2 = obs[6], obs[7]  # indices correct [web:6]
+        # +small bonus when BOTH touch (hover), not just down
+        if leg1 > 0.5 and leg2 > 0.5 and obs[1] > 0.1:  # ← ADD: and not landed yet
+            reward += 0.5  # ← smaller: 0.5 not 2.0
         return obs, reward, terminated, truncated, info
+
 
 
 class AccelPenaltyWrapper(gym.RewardWrapper):
@@ -118,14 +120,16 @@ from dataclasses import dataclass
 ENV_ID = "LunarLander-v3"  # if your gymnasium has only v2, change to "LunarLander-v2"
 POP_SIZE = 50  # population size
 N_GENERATIONS = 200  # number of generations
-ELITE_FRACTION = 0.2  # fraction kept as elites
+ELITE_FRACTION = 0.1  # fraction kept as elites
 MUTATION_STD = 0.1  # std-dev of Gaussian mutation
 EPISODES_PER_INDIVIDUAL = 5  # fitness = mean reward over these episodes
 MAX_STEPS_PER_EPISODE = 1000
+TEMP_START = 1.0        # Start hot (explore)
+TEMP_END = 0.1          # End cool (exploit)
+TEMP_DECAY = (TEMP_END / TEMP_START) ** (1 / N_GENERATIONS)  # Auto-calculates!
 
 INPUT_SIZE = 8  # LunarLander observation dim (x, y, vx, vy, angle, ang_vel, leg1, leg2)
-HIDDEN1_SIZE = 32
-HIDDEN2_SIZE = 16
+HIDDEN_SIZE = 32
 OUTPUT_SIZE = 4  # 4 discrete actions
 
 
@@ -156,6 +160,9 @@ def create_env(render_mode=None):
         penalty_weight=1.0,  # tuning-Parameter
         kill_on_violation=False,
         dt=1 / 50.0  # time interval (1 frame)
+    )
+    env = LegContactBonus(
+        env
     )
     return env
 
@@ -213,15 +220,15 @@ def init_population():
     return pop
 
 
-def evaluate_individual(individual: Individual, env):  # ADDED THIS
+def evaluate_individual(individual: Individual, env, temp=1.0):  # ← ADD temp param
     rewards = []
     for _ in range(EPISODES_PER_INDIVIDUAL):
-        obs, info = env.reset()
+        obs, info = env.reset(seed=None)  # Random seeds too!
         done = False
         total_r = 0.0
         steps = 0
         while not done and steps < MAX_STEPS_PER_EPISODE:
-            action = policy_act(individual.weights, obs)
+            action = policy_act(individual.weights, obs, temp=temp)  # ← PASS TEMP
             obs, reward, terminated, truncated, info = env.step(action)
             total_r += reward
             done = terminated or truncated
@@ -230,27 +237,24 @@ def evaluate_individual(individual: Individual, env):  # ADDED THIS
     return float(np.mean(rewards))
 
 
+
 def worker_evaluate(args):
-    ind_idx, individual, env_id = args
+    ind_idx, individual, env_id, current_temp = args  # ← ADD temp
     env = create_env(render_mode=None)
-    fitness = evaluate_individual(individual, env)  # Your single-threaded version
+    fitness = evaluate_individual(individual, env, temp=current_temp)  # ← PASS TEMP
     env.close()
-    return ind_idx, fitness  # ONLY 2 VALUES
+    return ind_idx, fitness
 
-
-def evaluate_population(population):
+def evaluate_population(population, current_temp):  # ← ADD temp param
     n_cores = min(mp.cpu_count(), POP_SIZE)
-    # print(f"Evaluating {len(population)} individuals on {n_cores} cores...")
-
-    args_list = [(i, ind, ENV_ID) for i, ind in enumerate(population)]
+    args_list = [(i, ind, ENV_ID, current_temp) for i, ind in enumerate(population)]  # ← PASS TEMP
 
     with mp.Pool(processes=n_cores) as pool:
         results = pool.map(worker_evaluate, args_list)
 
     results.sort(key=lambda x: x[0])
-    for i, (ind_idx, fitness) in enumerate(results):  # FIXED: 2 values only
+    for i, (ind_idx, fitness) in enumerate(results):
         population[i].fitness = fitness
-
 
 def select_elites(population):
     # sort by fitness descending
@@ -266,26 +270,27 @@ def crossover(parent1: Individual, parent2: Individual) -> Individual:
     return Individual(weights=child_weights)
 
 
-def mutate(individual: Individual):
-    noise = np.random.randn(N_PARAMS) * MUTATION_STD
-    individual.weights = individual.weights + noise
+def mutate(individual, gen):  # Pass gen
+    if gen < 50:
+        std = 0.15
+    elif gen < 150:
+        std = 0.08
+    else:
+        std = 0.03 + 0.1 * np.random.random()  # Late-game magic
+    noise = np.random.randn(N_PARAMS) * std
+    individual.weights += noise
 
 
-def create_next_generation(elites):
+def create_next_generation(elites, gen):  # ✅ ADD gen PARAMETER
     new_population = []
-
-    # keep elites (elitism)
     for elite in elites:
-        # copy to avoid modifying original
         new_population.append(Individual(weights=elite.weights.copy(), fitness=elite.fitness))
 
-    # fill the rest with crossover + mutation
     while len(new_population) < POP_SIZE:
         parents = np.random.choice(elites, size=2, replace=True)
         child = crossover(parents[0], parents[1])
-        mutate(child)
+        mutate(child, gen)                    # ✅ PASS GEN TO MUTATE
         new_population.append(child)
-
     return new_population
 
 
@@ -293,33 +298,25 @@ def load_policy(path="best_policy.npy") -> np.ndarray:
     return np.load(path)
 
 
-def watch_saved_policy(path="best_policy.npy", n_episodes=5):  # More episodes
+def watch_saved_policy(path="best_policy.npy", n_episodes=10):
     theta = load_policy(path)
     env = create_env(render_mode="human")
 
     for ep in range(n_episodes):
-        obs, info = env.reset(seed=42 + ep)
-        done = False;
-        total_r = 0.0;
+        obs, info = env.reset(seed=None)  # Random seeds!
+        done = False
+        total_r = 0.0
         steps = 0
-        accel_violations = 0;
-        touchdown_speed = None
 
         while not done and steps < MAX_STEPS_PER_EPISODE:
-            action = policy_act(theta, obs, temp=0.01, deterministic=True)  # FIXED
+            # FIXED: Use final training temp (0.37), NOT 0.01
+            action = policy_act(theta, obs, temp=0.37, deterministic=False)
             obs, reward, terminated, truncated, info = env.step(action)
             total_r += reward
             done = terminated or truncated
             steps += 1
 
-            # LOG WEAKNESS DETECTION
-            if info.get("accel_violation", False):
-                accel_violations += 1
-            if "touchdown_speed" in info:
-                touchdown_speed = info["touchdown_speed"]
-
-        print(f"Ep {ep} | R={total_r:.1f} | Steps={steps} | "
-              f"AccelViol={accel_violations} | TD_speed={touchdown_speed:.2f if touchdown_speed else 'N/A'}")
+        print(f"Ep {ep} | R={total_r:.1f} | Steps={steps}")
 
     env.close()
 
@@ -330,16 +327,15 @@ def watch_saved_policy(path="best_policy.npy", n_episodes=5):  # More episodes
 
 def main():
     np.random.seed(0)
-
     population = init_population()
     print(f"Initialized population with {POP_SIZE} individuals and {N_PARAMS} parameters each.")
 
     best_overall = None
+    current_temp = TEMP_START  # ← ADD
 
     for gen in range(N_GENERATIONS):
-        evaluate_population(population)
+        evaluate_population(population, current_temp)  # ← PASS TEMP
 
-        # track stats
         fitnesses = np.array([ind.fitness for ind in population])
         best_idx = int(np.argmax(fitnesses))
         best_gen = population[best_idx]
@@ -347,15 +343,14 @@ def main():
         if best_overall is None or best_gen.fitness > best_overall.fitness:
             best_overall = Individual(weights=best_gen.weights.copy(), fitness=best_gen.fitness)
 
-        print(
-            f"Gen {gen:03d} | "
-            f"mean: {fitnesses.mean():7.2f} | "
-            f"std: {fitnesses.std():6.2f} | "
-            f"best: {best_gen.fitness:7.2f} | "
-            f"best_overall: {best_overall.fitness:7.2f}"
-        )
-
-        population = create_next_generation(select_elites(population))
+        print(f"Gen {gen:03d} | "
+              f"mean: {fitnesses.mean():7.2f} | "
+              f"std: {fitnesses.std():6.2f} | "
+              f"best: {best_gen.fitness:7.2f} | "
+              f"best_overall: {best_overall.fitness:7.2f} | "
+              f"... | T={current_temp:.3f}")  # 0.104 not 0.37
+        population = create_next_generation(select_elites(population), gen)  # ✅ PASS GEN!
+        current_temp = max(TEMP_END, current_temp * TEMP_DECAY)  # ← COOL DOWN
 
     print("\nTraining finished.")
     print(f"Best overall fitness: {best_overall.fitness:.2f}")
