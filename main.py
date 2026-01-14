@@ -1,8 +1,9 @@
 import multiprocessing as mp
 import os
 import warnings
-
+import numpy as np
 import gymnasium as gym
+from dataclasses import dataclass
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
@@ -11,12 +12,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 class LegContactBonus(gym.RewardWrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        leg1, leg2 = obs[6], obs[7]  # indices correct [web:6]
-        # +small bonus when BOTH touch (hover), not just down
-        if leg1 > 0.5 and leg2 > 0.5 and obs[1] > 0.1:  # ← ADD: and not landed yet
-            reward += 0.5  # ← smaller: 0.5 not 2.0
+        leg1, leg2 = obs[6], obs[7]
+        if leg1 > 0.5 and leg2 > 0.5 and obs[1] > 0.1:
+            reward += 0.5
         return obs, reward, terminated, truncated, info
-
 
 
 class AccelPenaltyWrapper(gym.RewardWrapper):
@@ -26,16 +25,12 @@ class AccelPenaltyWrapper(gym.RewardWrapper):
         self.penalty_weight = penalty_weight
         self.kill_on_violation = kill_on_violation
         self.dt = dt
-
         self.prev_vx = None
         self.prev_vy = None
-
-        # optional: Info im observation_space unverändert lassen
         self.reward_range = (-np.inf, np.inf)
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        # Geschwindigkeiten aus Observation holen
         vx = obs[2]
         vy = obs[3]
         self.prev_vx = vx
@@ -48,27 +43,20 @@ class AccelPenaltyWrapper(gym.RewardWrapper):
         vx = obs[2]
         vy = obs[3]
 
-        # diskrete Beschleunigung
         ax = (vx - self.prev_vx) / self.dt
         ay = (vy - self.prev_vy) / self.dt
         a = np.sqrt(ax ** 2 + ay ** 2)
 
-        # für nächsten Schritt merken
         self.prev_vx = vx
         self.prev_vy = vy
 
-        # Penalty/Abbruch
         if a > self.max_acc:
-            # negative Belohnung proportional zur Überschreitung
             penalty = self.penalty_weight * (a - self.max_acc)
             reward -= penalty
-
-            # optional: Episode beenden, Astronaut „stirbt“
             if self.kill_on_violation:
                 terminated = True
                 info["accel_violation"] = True
 
-        # Beschleunigung im info mitgeben
         info["accel"] = a
         info["accel_vec"] = (ax, ay)
 
@@ -94,13 +82,11 @@ class TouchdownVelocityWrapper(gym.RewardWrapper):
         touchdown = leg1 or leg2
 
         if touchdown and not info.get("touchdown_checked", False):
-            # Erstes Mal Bodenkontakt in dieser Episode
             info["touchdown_checked"] = True
             info["touchdown_speed"] = speed
 
             if speed > self.max_touchdown_speed:
-                # zu schnell aufgesetzt
-                reward += self.penalty  # z.B. -100 dazu
+                reward += self.penalty
                 info["touchdown_too_fast"] = True
                 if self.kill_on_violation:
                     terminated = True
@@ -108,37 +94,25 @@ class TouchdownVelocityWrapper(gym.RewardWrapper):
         return obs, reward, terminated, truncated, info
 
 
-import gymnasium as gym
-import numpy as np
-from dataclasses import dataclass
-
-# =============================
-# Config
-# =============================
-
-ENV_ID = "LunarLander-v3"  # if your gymnasium has only v2, change to "LunarLander-v2"
-POP_SIZE = 50  # population size
-N_GENERATIONS = 200  # number of generations
-ELITE_FRACTION = 0.1  # fraction kept as elites
-MUTATION_STD = 0.1  # std-dev of Gaussian mutation
-EPISODES_PER_INDIVIDUAL = 5  # fitness = mean reward over these episodes
+ENV_ID = "LunarLander-v3"
+POP_SIZE = 50
+N_GENERATIONS = 200
+ELITE_FRACTION = 0.1
+MUTATION_STD = 0.1
+EPISODES_PER_INDIVIDUAL = 5
 MAX_STEPS_PER_EPISODE = 1000
-TEMP_START = 1.0        # Start hot (explore)
-TEMP_END = 0.1          # End cool (exploit)
-TEMP_DECAY = (TEMP_END / TEMP_START) ** (1 / N_GENERATIONS)  # Auto-calculates!
+TEMP_START = 1.0
+TEMP_END = 0.1
+TEMP_DECAY = (TEMP_END / TEMP_START) ** (1 / N_GENERATIONS)
 
-INPUT_SIZE = 8  # LunarLander observation dim (x, y, vx, vy, angle, ang_vel, leg1, leg2)
+INPUT_SIZE = 8
 HIDDEN_SIZE = 32
-OUTPUT_SIZE = 4  # 4 discrete actions
+OUTPUT_SIZE = 4
 
-
-# =============================
-# Policy / Genome definition
-# =============================
 
 @dataclass
 class Individual:
-    weights: np.ndarray  # flattened parameter vector
+    weights: np.ndarray
     fitness: float = -np.inf
 
 
@@ -152,22 +126,18 @@ def create_env(render_mode=None):
         wind_power=15.0,
         turbulence_power=1.5,
     )
-    # Astronauten-Schutz einbauen
     env = AccelPenaltyWrapper(
         env,
-        max_acc=1.0,  # tuning-Parameter
-        penalty_weight=1.0,  # tuning-Parameter
+        max_acc=1.0,
+        penalty_weight=1.0,
         kill_on_violation=False,
-        dt=1 / 50.0  # time interval (1 frame)
+        dt=1 / 50.0
     )
-    env = LegContactBonus(
-        env
-    )
+    env = LegContactBonus(env)
     return env
 
 
 def get_param_sizes():
-    # Two-layer MLP: input -> hidden -> output
     w1_size = INPUT_SIZE * HIDDEN_SIZE
     b1_size = HIDDEN_SIZE
     w2_size = HIDDEN_SIZE * OUTPUT_SIZE
@@ -198,36 +168,32 @@ def policy_act(theta: np.ndarray, obs: np.ndarray, temp=1.0, deterministic=False
     h = np.maximum(0, x @ w1 + b1)
     logits = h @ w2 + b2
 
-    if deterministic:  # NEW: argmax for demos
+    if deterministic:
         return np.argmax(logits)
-    else:  # softmax for training
-        logits = np.clip(logits, -10*temp, 10*temp)  # Scale with temp
+    else:
+        logits = np.clip(logits, -10*temp, 10*temp)
         exp_logits = np.exp(logits / temp)
         probs = exp_logits / np.sum(exp_logits)
         return np.random.choice(4, p=probs)
 
-# =============================
-# GA operators
-# =============================
 
 def init_population():
     pop = []
     for _ in range(POP_SIZE):
-        # small random init around 0
         theta = np.random.randn(N_PARAMS) * 0.1
         pop.append(Individual(weights=theta))
     return pop
 
 
-def evaluate_individual(individual: Individual, env, temp=1.0):  # ← ADD temp param
+def evaluate_individual(individual: Individual, env, temp=1.0):
     rewards = []
     for _ in range(EPISODES_PER_INDIVIDUAL):
-        obs, info = env.reset(seed=None)  # Random seeds too!
+        obs, info = env.reset(seed=None)
         done = False
         total_r = 0.0
         steps = 0
         while not done and steps < MAX_STEPS_PER_EPISODE:
-            action = policy_act(individual.weights, obs, temp=temp)  # ← PASS TEMP
+            action = policy_act(individual.weights, obs, temp=temp)
             obs, reward, terminated, truncated, info = env.step(action)
             total_r += reward
             done = terminated or truncated
@@ -236,17 +202,17 @@ def evaluate_individual(individual: Individual, env, temp=1.0):  # ← ADD temp 
     return float(np.mean(rewards))
 
 
-
 def worker_evaluate(args):
-    ind_idx, individual, env_id, current_temp = args  # ← ADD temp
+    ind_idx, individual, env_id, current_temp = args
     env = create_env(render_mode=None)
-    fitness = evaluate_individual(individual, env, temp=current_temp)  # ← PASS TEMP
+    fitness = evaluate_individual(individual, env, temp=current_temp)
     env.close()
     return ind_idx, fitness
 
-def evaluate_population(population, current_temp):  # ← ADD temp param
+
+def evaluate_population(population, current_temp):
     n_cores = min(mp.cpu_count(), POP_SIZE)
-    args_list = [(i, ind, ENV_ID, current_temp) for i, ind in enumerate(population)]  # ← PASS TEMP
+    args_list = [(i, ind, ENV_ID, current_temp) for i, ind in enumerate(population)]
 
     with mp.Pool(processes=n_cores) as pool:
         results = pool.map(worker_evaluate, args_list)
@@ -255,32 +221,31 @@ def evaluate_population(population, current_temp):  # ← ADD temp param
     for i, (ind_idx, fitness) in enumerate(results):
         population[i].fitness = fitness
 
+
 def select_elites(population):
-    # sort by fitness descending
     population.sort(key=lambda ind: ind.fitness, reverse=True)
     n_elite = max(1, int(ELITE_FRACTION * POP_SIZE))
     return population[:n_elite]
 
 
 def crossover(parent1: Individual, parent2: Individual) -> Individual:
-    # uniform crossover
     mask = np.random.rand(N_PARAMS) < 0.5
     child_weights = np.where(mask, parent1.weights, parent2.weights)
     return Individual(weights=child_weights)
 
 
-def mutate(individual, gen):  # Pass gen
+def mutate(individual, gen):
     if gen < 50:
         std = 0.15
     elif gen < 150:
         std = 0.08
     else:
-        std = 0.03 + 0.1 * np.random.random()  # Late-game magic
+        std = 0.03 + 0.1 * np.random.random()
     noise = np.random.randn(N_PARAMS) * std
     individual.weights += noise
 
 
-def create_next_generation(elites, gen):  # ✅ ADD gen PARAMETER
+def create_next_generation(elites, gen):
     new_population = []
     for elite in elites:
         new_population.append(Individual(weights=elite.weights.copy(), fitness=elite.fitness))
@@ -288,7 +253,7 @@ def create_next_generation(elites, gen):  # ✅ ADD gen PARAMETER
     while len(new_population) < POP_SIZE:
         parents = np.random.choice(elites, size=2, replace=True)
         child = crossover(parents[0], parents[1])
-        mutate(child, gen)                    # ✅ PASS GEN TO MUTATE
+        mutate(child, gen)
         new_population.append(child)
     return new_population
 
@@ -302,13 +267,12 @@ def watch_saved_policy(path="best_policy.npy", n_episodes=10):
     env = create_env(render_mode="human")
 
     for ep in range(n_episodes):
-        obs, info = env.reset(seed=None)  # Random seeds!
+        obs, info = env.reset(seed=None)
         done = False
         total_r = 0.0
         steps = 0
 
         while not done and steps < MAX_STEPS_PER_EPISODE:
-            # FIXED: Use final training temp (0.37), NOT 0.01
             action = policy_act(theta, obs, temp=0.37, deterministic=False)
             obs, reward, terminated, truncated, info = env.step(action)
             total_r += reward
@@ -320,20 +284,16 @@ def watch_saved_policy(path="best_policy.npy", n_episodes=10):
     env.close()
 
 
-# =============================
-# Main GA loop
-# =============================
-
 def main():
     np.random.seed(0)
     population = init_population()
     print(f"Initialized population with {POP_SIZE} individuals and {N_PARAMS} parameters each.")
 
     best_overall = None
-    current_temp = TEMP_START  # ← ADD
+    current_temp = TEMP_START
 
     for gen in range(N_GENERATIONS):
-        evaluate_population(population, current_temp)  # ← PASS TEMP
+        evaluate_population(population, current_temp)
 
         fitnesses = np.array([ind.fitness for ind in population])
         best_idx = int(np.argmax(fitnesses))
@@ -347,16 +307,13 @@ def main():
               f"std: {fitnesses.std():6.2f} | "
               f"best: {best_gen.fitness:7.2f} | "
               f"best_overall: {best_overall.fitness:7.2f} | "
-              f"... | T={current_temp:.3f}")  # 0.104 not 0.37
-        population = create_next_generation(select_elites(population), gen)  # ✅ PASS GEN!
-        current_temp = max(TEMP_END, current_temp * TEMP_DECAY)  # ← COOL DOWN
+              f"... | T={current_temp:.3f}")
+        population = create_next_generation(select_elites(population), gen)
+        current_temp = max(TEMP_END, current_temp * TEMP_DECAY)
 
     print("\nTraining finished.")
     print(f"Best overall fitness: {best_overall.fitness:.2f}")
 
-    # =========================
-    # Watch best individual
-    # =========================
     env = create_env(render_mode="human")
     obs, info = env.reset(seed=42)
     done = False
@@ -370,25 +327,17 @@ def main():
         done = terminated or truncated
         steps += 1
 
-        # hier: Beschleunigung in der Konsole zeigen
-        # if "accel" in info:
-        # print(f"Step {steps:4d} | a = {info['accel']:.3f}  ax, ay = {info['accel_vec']}")
-
     print(f"Episode reward of best individual: {total_r:.2f}")
     input("Press Enter to close the window...")
-    print("\nTraining finished.")
-    print(f"Best overall fitness: {best_overall.fitness:.2f}")
-
-    # Gewichte speichern
     np.save("best_policy.npy", best_overall.weights)
     print("Saved best policy to best_policy.npy")
     env.close()
 
 
 if __name__ == "__main__":
-    mode = "train"
+    mode = "play"
     if mode == "train":
-        mp.set_start_method('spawn', force=True)  # Essential for Gym + multiprocessing
+        mp.set_start_method('spawn', force=True)
         main()
     elif mode == "play":
         watch_saved_policy("best_policy.npy")
